@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::cell::{RefCell, RefMut};
+use std::cell::RefCell;
 use std::cmp::max;
 use std::convert::TryInto;
 use std::io::Read;
@@ -14,18 +14,22 @@ use anyhow::{anyhow, bail};
 use async_io::Timer;
 use async_trait::async_trait;
 use config::ConfigHandle;
-use filedescriptor::FileDescriptor;
 use promise::{Future, Promise};
 use raw_window_handle::{
     HasRawDisplayHandle, HasRawWindowHandle, RawDisplayHandle, RawWindowHandle,
     WaylandDisplayHandle, WaylandWindowHandle,
 };
 use smithay_client_toolkit::compositor::{CompositorHandler, SurfaceData, SurfaceDataExt};
-use smithay_client_toolkit::shell::xdg::frame::fallback_frame::FallbackFrame;
-use smithay_client_toolkit::shell::xdg::frame::{DecorationsFrame, FrameAction};
+use smithay_client_toolkit::data_device_manager::ReadPipe;
+use smithay_client_toolkit::reexports::csd_frame::{
+    DecorationsFrame, FrameAction, ResizeEdge, WindowState as SCTKWindowState,
+};
+use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as XdgResizeEdge;
+use smithay_client_toolkit::seat::pointer::CursorIcon;
+use smithay_client_toolkit::shell::xdg::fallback_frame::FallbackFrame;
 use smithay_client_toolkit::shell::xdg::window::{
     DecorationMode, Window as XdgWindow, WindowConfigure, WindowDecorations as Decorations,
-    WindowHandler, WindowState as SCTKWindowState,
+    WindowHandler,
 };
 use smithay_client_toolkit::shell::xdg::XdgSurface;
 use smithay_client_toolkit::shell::WaylandSurface;
@@ -193,11 +197,6 @@ impl WaylandWindow {
             compositor.create_surface_with_data(&qh, surface_data)
         };
 
-        let pointer_surface = {
-            let compositor = &conn.wayland_state.borrow().compositor;
-            compositor.create_surface(&qh)
-        };
-
         let ResolvedGeometry {
             x: _,
             y: _,
@@ -290,7 +289,6 @@ impl WaylandWindow {
             key_repeat: None,
             pending_event,
             pending_mouse,
-            pointer_surface,
 
             pending_first_configure: Some(pending_first_configure),
             frame_callback: None,
@@ -465,10 +463,18 @@ pub(crate) struct PendingEvent {
     pub(crate) window_state: Option<WindowState>,
 }
 
-pub(crate) fn read_pipe_with_timeout(mut file: FileDescriptor) -> anyhow::Result<String> {
+pub(crate) fn read_pipe_with_timeout(mut file: ReadPipe) -> anyhow::Result<String> {
     let mut result = Vec::new();
 
-    file.set_non_blocking(true)?;
+    // set non-blocking I/O on the pipe
+    // (adapted from FileDescriptor::set_non_blocking_impl in /filedescriptor/src/unix.rs)
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } != 0 {
+        bail!(
+            "failed to change non-blocking mode: {}",
+            std::io::Error::last_os_error()
+        )
+    }
+
     let mut pfd = libc::pollfd {
         fd: file.as_raw_fd(),
         events: libc::POLLIN,
@@ -505,7 +511,6 @@ pub struct WaylandWindowInner {
     dimensions: Dimensions,
     resize_increments: Option<ResizeIncrement>,
     window_state: WindowState,
-    pointer_surface: WlSurface,
     last_mouse_coords: Point,
     mouse_buttons: MouseButtons,
     hscroll_remainder: f64,
@@ -905,27 +910,33 @@ impl WaylandWindowInner {
     }
 
     fn set_cursor(&mut self, cursor: Option<MouseCursor>) {
-        let name = cursor.map_or("none", |cursor| match cursor {
-            MouseCursor::Arrow => "arrow",
-            MouseCursor::Hand => "hand",
-            MouseCursor::SizeUpDown => "ns-resize",
-            MouseCursor::SizeLeftRight => "ew-resize",
-            MouseCursor::Text => "xterm",
-        });
         let conn = Connection::get().unwrap().wayland();
         let state = conn.wayland_state.borrow_mut();
-        let (shm, pointer) =
-            RefMut::map_split(state, |s| (&mut s.shm, s.pointer.as_mut().unwrap()));
+        let pointer = match &state.pointer {
+            Some(pointer) => pointer,
+            None => return,
+        };
 
-        // Much different API in 0.18
-        if let Err(err) = pointer.set_cursor(
-            &conn.connection,
-            name,
-            shm.wl_shm(),
-            &self.pointer_surface,
-            1,
-        ) {
-            log::error!("set_cursor: {}", err);
+        match cursor {
+            Some(cursor) => {
+                if let Err(err) = pointer.set_cursor(
+                    &conn.connection,
+                    match cursor {
+                        MouseCursor::Arrow => CursorIcon::Default,
+                        MouseCursor::Hand => CursorIcon::Pointer,
+                        MouseCursor::SizeUpDown => CursorIcon::NsResize,
+                        MouseCursor::SizeLeftRight => CursorIcon::EwResize,
+                        MouseCursor::Text => CursorIcon::Text,
+                    },
+                ) {
+                    log::error!("set_cursor: {}", err);
+                }
+            }
+            None => {
+                if let Err(err) = pointer.hide_cursor() {
+                    log::error!("hide_cursor: {}", err)
+                }
+            }
         }
     }
 
@@ -1156,8 +1167,23 @@ impl WaylandWindowInner {
                     .unwrap()
                     .show_window_menu(seat, serial, (x, y))
             }
-            FrameAction::Resize(edge) => self.window.as_ref().unwrap().resize(seat, serial, edge),
+            FrameAction::Resize(edge) => {
+                let edge = match edge {
+                    ResizeEdge::None => XdgResizeEdge::None,
+                    ResizeEdge::Top => XdgResizeEdge::Top,
+                    ResizeEdge::Bottom => XdgResizeEdge::Bottom,
+                    ResizeEdge::Left => XdgResizeEdge::Left,
+                    ResizeEdge::TopLeft => XdgResizeEdge::TopLeft,
+                    ResizeEdge::BottomLeft => XdgResizeEdge::BottomLeft,
+                    ResizeEdge::Right => XdgResizeEdge::Right,
+                    ResizeEdge::TopRight => XdgResizeEdge::TopRight,
+                    ResizeEdge::BottomRight => XdgResizeEdge::BottomRight,
+                    _ => return, // Realistically, there probably won't be any new edges added.
+                };
+                self.window.as_ref().unwrap().resize(seat, serial, edge)
+            }
             FrameAction::Move => self.window.as_ref().unwrap().move_(seat, serial),
+            _ => log::warn!("unhandled FrameAction: {:?}", action),
         }
     }
 }
@@ -1266,6 +1292,16 @@ impl CompositorHandler for WaylandState {
             inner.next_frame_is_ready();
             Ok(())
         });
+    }
+
+    fn transform_changed(
+        &mut self,
+        _conn: &WConnection,
+        _qh: &wayland_client::QueueHandle<Self>,
+        _surface: &wayland_client::protocol::wl_surface::WlSurface,
+        _new_transform: wayland_client::protocol::wl_output::Transform,
+    ) {
+        // TODO: do we need to do anything here?
     }
 }
 
